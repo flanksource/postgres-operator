@@ -1,3 +1,4 @@
+import json
 import unittest
 import time
 import timeout_decorator
@@ -50,7 +51,9 @@ class EndToEndTestCase(unittest.TestCase):
 
         for filename in ["operator-service-account-rbac.yaml",
                          "configmap.yaml",
-                         "postgres-operator.yaml"]:
+                         "postgres-operator.yaml",
+                         "infrastructure-roles.yaml",
+                         "infrastructure-roles-new.yaml"]:
             result = k8s.create_with_kubectl("manifests/" + filename)
             print("stdout: {}, stderr: {}".format(result.stdout, result.stderr))
 
@@ -65,6 +68,83 @@ class EndToEndTestCase(unittest.TestCase):
         try:
             k8s.wait_for_pod_start('spilo-role=master')
             k8s.wait_for_pod_start('spilo-role=replica')
+        except timeout_decorator.TimeoutError:
+            print('Operator log: {}'.format(k8s.get_operator_log()))
+            raise
+
+    @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
+    def test_enable_disable_connection_pooler(self):
+        '''
+        For a database without connection pooler, then turns it on, scale up,
+        turn off and on again. Test with different ways of doing this (via
+        enableConnectionPooler or connectionPooler configuration section). At
+        the end turn connection pooler off to not interfere with other tests.
+        '''
+        k8s = self.k8s
+        service_labels = {
+            'cluster-name': 'acid-minimal-cluster',
+        }
+        pod_labels = dict({
+            'connection-pooler': 'acid-minimal-cluster-pooler',
+        })
+
+        pod_selector = to_selector(pod_labels)
+        service_selector = to_selector(service_labels)
+
+        try:
+            # enable connection pooler
+            k8s.api.custom_objects_api.patch_namespaced_custom_object(
+                'acid.zalan.do', 'v1', 'default',
+                'postgresqls', 'acid-minimal-cluster',
+                {
+                    'spec': {
+                        'enableConnectionPooler': True,
+                    }
+                })
+            k8s.wait_for_pod_start(pod_selector)
+
+            pods = k8s.api.core_v1.list_namespaced_pod(
+                'default', label_selector=pod_selector
+            ).items
+
+            self.assertTrue(pods, 'No connection pooler pods')
+
+            k8s.wait_for_service(service_selector)
+            services = k8s.api.core_v1.list_namespaced_service(
+                'default', label_selector=service_selector
+            ).items
+            services = [
+                s for s in services
+                if s.metadata.name.endswith('pooler')
+            ]
+
+            self.assertTrue(services, 'No connection pooler service')
+
+            # scale up connection pooler deployment
+            k8s.api.custom_objects_api.patch_namespaced_custom_object(
+                'acid.zalan.do', 'v1', 'default',
+                'postgresqls', 'acid-minimal-cluster',
+                {
+                    'spec': {
+                        'connectionPooler': {
+                            'numberOfInstances': 2,
+                        },
+                    }
+                })
+
+            k8s.wait_for_running_pods(pod_selector, 2)
+
+            # turn it off, keeping configuration section
+            k8s.api.custom_objects_api.patch_namespaced_custom_object(
+                'acid.zalan.do', 'v1', 'default',
+                'postgresqls', 'acid-minimal-cluster',
+                {
+                    'spec': {
+                        'enableConnectionPooler': False,
+                    }
+                })
+            k8s.wait_for_pods_to_stop(pod_selector)
+
         except timeout_decorator.TimeoutError:
             print('Operator log: {}'.format(k8s.get_operator_log()))
             raise
@@ -117,6 +197,66 @@ class EndToEndTestCase(unittest.TestCase):
         repl_svc_type = k8s.get_service_type(cluster_label + ',spilo-role=replica')
         self.assertEqual(repl_svc_type, 'ClusterIP',
                          "Expected ClusterIP service type for replica, found {}".format(repl_svc_type))
+
+    @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
+    def test_lazy_spilo_upgrade(self):
+        '''
+        Test lazy upgrade for the Spilo image: operator changes a stateful set but lets pods run with the old image
+        until they are recreated for reasons other than operator's activity. That works because the operator configures
+        stateful sets to use "onDelete" pod update policy.
+
+        The test covers:
+        1) enabling lazy upgrade in existing operator deployment
+        2) forcing the normal rolling upgrade by changing the operator configmap and restarting its pod
+        '''
+
+        k8s = self.k8s
+
+        # update docker image in config and enable the lazy upgrade
+        conf_image = "registry.opensource.zalan.do/acid/spilo-cdp-12:1.6-p114"
+        patch_lazy_spilo_upgrade = {
+            "data": {
+                "docker_image": conf_image,
+                "enable_lazy_spilo_upgrade": "true"
+            }
+        }
+        k8s.update_config(patch_lazy_spilo_upgrade)
+
+        pod0 = 'acid-minimal-cluster-0'
+        pod1 = 'acid-minimal-cluster-1'
+
+        # restart the pod to get a container with the new image
+        k8s.api.core_v1.delete_namespaced_pod(pod0, 'default')
+        time.sleep(60)
+
+        # lazy update works if the restarted pod and older pods run different Spilo versions
+        new_image = k8s.get_effective_pod_image(pod0)
+        old_image = k8s.get_effective_pod_image(pod1)
+        self.assertNotEqual(new_image, old_image, "Lazy updated failed: pods have the same image {}".format(new_image))
+
+        # sanity check
+        assert_msg = "Image {} of a new pod differs from {} in operator conf".format(new_image, conf_image)
+        self.assertEqual(new_image, conf_image, assert_msg)
+
+        # clean up
+        unpatch_lazy_spilo_upgrade = {
+            "data": {
+                "enable_lazy_spilo_upgrade": "false",
+            }
+        }
+        k8s.update_config(unpatch_lazy_spilo_upgrade)
+
+        # at this point operator will complete the normal rolling upgrade
+        # so we additonally test if disabling the lazy upgrade - forcing the normal rolling upgrade - works
+
+        # XXX there is no easy way to wait until the end of Sync()
+        time.sleep(60)
+
+        image0 = k8s.get_effective_pod_image(pod0)
+        image1 = k8s.get_effective_pod_image(pod1)
+
+        assert_msg = "Disabling lazy upgrade failed: pods still have different images {} and {}".format(image0, image1)
+        self.assertEqual(image0, image1, assert_msg)
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     def test_logical_backup_cron_job(self):
@@ -258,7 +398,6 @@ class EndToEndTestCase(unittest.TestCase):
         '''
         k8s = self.k8s
         cluster_label = 'application=spilo,cluster-name=acid-minimal-cluster'
-        labels = 'spilo-role=master,' + cluster_label
         readiness_label = 'lifecycle-status'
         readiness_value = 'ready'
 
@@ -290,6 +429,10 @@ class EndToEndTestCase(unittest.TestCase):
 
         # patch also node where master ran before
         k8s.api.core_v1.patch_node(current_master_node, patch_readiness_label)
+
+        # wait a little before proceeding with the pod distribution test
+        time.sleep(30)
+
         # toggle pod anti affinity to move replica away from master node
         self.assert_distributed_pods(new_master_node, new_replica_nodes, cluster_label)
 
@@ -325,21 +468,24 @@ class EndToEndTestCase(unittest.TestCase):
         pg_patch_custom_annotations = {
             "spec": {
                 "serviceAnnotations": {
-                    "annotation.key": "value"
+                    "annotation.key": "value",
+                    "foo": "bar",
                 }
             }
         }
         k8s.api.custom_objects_api.patch_namespaced_custom_object(
             "acid.zalan.do", "v1", "default", "postgresqls", "acid-minimal-cluster", pg_patch_custom_annotations)
 
+        # wait a little before proceeding
+        time.sleep(30)
         annotations = {
             "annotation.key": "value",
             "foo": "bar",
         }
         self.assertTrue(k8s.check_service_annotations(
-            "cluster-name=acid-service-annotations,spilo-role=master", annotations))
+            "cluster-name=acid-minimal-cluster,spilo-role=master", annotations))
         self.assertTrue(k8s.check_service_annotations(
-            "cluster-name=acid-service-annotations,spilo-role=replica", annotations))
+            "cluster-name=acid-minimal-cluster,spilo-role=replica", annotations))
 
         # clean up
         unpatch_custom_service_annotations = {
@@ -350,90 +496,38 @@ class EndToEndTestCase(unittest.TestCase):
         k8s.update_config(unpatch_custom_service_annotations)
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
-    def test_enable_disable_connection_pool(self):
+    def test_statefulset_annotation_propagation(self):
         '''
-        For a database without connection pool, then turns it on, scale up,
-        turn off and on again. Test with different ways of doing this (via
-        enableConnectionPool or connectionPool configuration section). At the
-        end turn the connection pool off to not interfere with other tests.
+           Inject annotation to Postgresql CRD and check it's propagation to stateful set
         '''
         k8s = self.k8s
-        service_labels = {
-            'cluster-name': 'acid-minimal-cluster',
+        cluster_label = 'application=spilo,cluster-name=acid-minimal-cluster'
+
+        patch_sset_propagate_annotations = {
+            "data": {
+                "downscaler_annotations": "deployment-time,downscaler/*",
+            }
         }
-        pod_labels = dict({
-            'connection-pool': 'acid-minimal-cluster-pooler',
-        })
+        k8s.update_config(patch_sset_propagate_annotations)
 
-        pod_selector = to_selector(pod_labels)
-        service_selector = to_selector(service_labels)
+        pg_crd_annotations = {
+            "metadata": {
+                "annotations": {
+                    "deployment-time": "2020-04-30 12:00:00",
+                    "downscaler/downtime_replicas": "0",
+                },
+            }
+        }
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default", "postgresqls", "acid-minimal-cluster", pg_crd_annotations)
 
-        try:
-            # enable connection pool
-            k8s.api.custom_objects_api.patch_namespaced_custom_object(
-                'acid.zalan.do', 'v1', 'default',
-                'postgresqls', 'acid-minimal-cluster',
-                {
-                    'spec': {
-                        'enableConnectionPool': True,
-                    }
-                })
-            k8s.wait_for_pod_start(pod_selector)
-
-            pods = k8s.api.core_v1.list_namespaced_pod(
-                'default', label_selector=pod_selector
-            ).items
-
-            self.assertTrue(pods, 'No connection pool pods')
-
-            k8s.wait_for_service(service_selector)
-            services = k8s.api.core_v1.list_namespaced_service(
-                'default', label_selector=service_selector
-            ).items
-            services = [
-                s for s in services
-                if s.metadata.name.endswith('pooler')
-            ]
-
-            self.assertTrue(services, 'No connection pool service')
-
-            # scale up connection pool deployment
-            k8s.api.custom_objects_api.patch_namespaced_custom_object(
-                'acid.zalan.do', 'v1', 'default',
-                'postgresqls', 'acid-minimal-cluster',
-                {
-                    'spec': {
-                        'connectionPool': {
-                            'numberOfInstances': 2,
-                        },
-                    }
-                })
-
-            k8s.wait_for_running_pods(pod_selector, 2)
-
-            # turn it off, keeping configuration section
-            k8s.api.custom_objects_api.patch_namespaced_custom_object(
-                'acid.zalan.do', 'v1', 'default',
-                'postgresqls', 'acid-minimal-cluster',
-                {
-                    'spec': {
-                        'enableConnectionPool': False,
-                    }
-                })
-            k8s.wait_for_pods_to_stop(pod_selector)
-
-            k8s.api.custom_objects_api.patch_namespaced_custom_object(
-                'acid.zalan.do', 'v1', 'default',
-                'postgresqls', 'acid-minimal-cluster',
-                {
-                    'spec': {
-                        'enableConnectionPool': True,
-                    }
-                })
-            k8s.wait_for_pod_start(pod_selector)
-        except timeout_decorator.TimeoutError:
-            print('Operator log: {}'.format(k8s.get_operator_log()))
-            raise
+        # wait a little before proceeding
+        time.sleep(60)
+        annotations = {
+            "deployment-time": "2020-04-30 12:00:00",
+            "downscaler/downtime_replicas": "0",
+        }
+        self.assertTrue(k8s.check_statefulset_annotations(cluster_label, annotations))
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     def test_taint_based_eviction(self):
@@ -473,8 +567,52 @@ class EndToEndTestCase(unittest.TestCase):
         }
         k8s.update_config(patch_toleration_config)
 
+        # wait a little before proceeding with the pod distribution test
+        time.sleep(30)
+
         # toggle pod anti affinity to move replica away from master node
         self.assert_distributed_pods(new_master_node, new_replica_nodes, cluster_label)
+
+    @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
+    def test_infrastructure_roles(self):
+        '''
+            Test using external secrets for infrastructure roles
+        '''
+        k8s = self.k8s
+        # update infrastructure roles description
+        secret_name = "postgresql-infrastructure-roles"
+        roles = "secretname: postgresql-infrastructure-roles-new, userkey: user, rolekey: memberof, passwordkey: password, defaultrolevalue: robot_zmon"
+        patch_infrastructure_roles = {
+            "data": {
+                "infrastructure_roles_secret_name": secret_name,
+                "infrastructure_roles_secrets": roles,
+            },
+        }
+        k8s.update_config(patch_infrastructure_roles)
+
+        # wait a little before proceeding
+        time.sleep(30)
+
+        # check that new roles are represented in the config by requesting the
+        # operator configuration via API
+        operator_pod = k8s.get_operator_pod()
+        get_config_cmd = "wget --quiet -O - localhost:8080/config"
+        result = k8s.exec_with_kubectl(operator_pod.metadata.name, get_config_cmd)
+        roles_dict = (json.loads(result.stdout)
+                    .get("controller", {})
+                    .get("InfrastructureRoles"))
+
+        self.assertTrue("robot_zmon_acid_monitoring_new" in roles_dict)
+        role = roles_dict["robot_zmon_acid_monitoring_new"]
+        role.pop("Password", None)
+        self.assertDictEqual(role, {
+            "Name": "robot_zmon_acid_monitoring_new",
+            "Flags": None,
+            "MemberOf": ["robot_zmon"],
+            "Parameters": None,
+            "AdminRole": "",
+            "Origin": 2,
+        })
 
     def get_failover_targets(self, master_node, replica_nodes):
         '''
@@ -588,7 +726,7 @@ class K8s:
 
     def wait_for_operator_pod_start(self):
         self. wait_for_pod_start("name=postgres-operator")
-        # HACK operator must register CRD / add existing PG clusters after pod start up
+        # HACK operator must register CRD and/or Sync existing PG clusters after start up
         # for local execution ~ 10 seconds suffices
         time.sleep(60)
 
@@ -637,10 +775,18 @@ class K8s:
     def check_service_annotations(self, svc_labels, annotations, namespace='default'):
         svcs = self.api.core_v1.list_namespaced_service(namespace, label_selector=svc_labels, limit=1).items
         for svc in svcs:
-            if len(svc.metadata.annotations) != len(annotations):
-                return False
-            for key in svc.metadata.annotations:
-                if svc.metadata.annotations[key] != annotations[key]:
+            for key, value in annotations.items():
+                if key not in svc.metadata.annotations or svc.metadata.annotations[key] != value:
+                    print("Expected key {} not found in annotations {}".format(key, svc.metadata.annotation))
+                    return False
+        return True
+
+    def check_statefulset_annotations(self, sset_labels, annotations, namespace='default'):
+        ssets = self.api.apps_v1.list_namespaced_stateful_set(namespace, label_selector=sset_labels, limit=1).items
+        for sset in ssets:
+            for key, value in annotations.items():
+                if key not in sset.metadata.annotations or sset.metadata.annotations[key] != value:
+                    print("Expected key {} not found in annotations {}".format(key, sset.metadata.annotation))
                     return False
         return True
 
@@ -702,19 +848,35 @@ class K8s:
     def wait_for_logical_backup_job_creation(self):
         self.wait_for_logical_backup_job(expected_num_of_jobs=1)
 
-    def update_config(self, config_map_patch):
-        self.api.core_v1.patch_namespaced_config_map("postgres-operator", "default", config_map_patch)
-
+    def delete_operator_pod(self):
         operator_pod = self.api.core_v1.list_namespaced_pod(
             'default', label_selector="name=postgres-operator").items[0].metadata.name
         self.api.core_v1.delete_namespaced_pod(operator_pod, "default")  # restart reloads the conf
         self.wait_for_operator_pod_start()
+
+    def update_config(self, config_map_patch):
+        self.api.core_v1.patch_namespaced_config_map("postgres-operator", "default", config_map_patch)
+        self.delete_operator_pod()
 
     def create_with_kubectl(self, path):
         return subprocess.run(
             ["kubectl", "create", "-f", path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
+
+    def exec_with_kubectl(self, pod, cmd):
+        return subprocess.run(["./exec.sh", pod, cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+
+    def get_effective_pod_image(self, pod_name, namespace='default'):
+        '''
+        Get the Spilo image pod currently uses. In case of lazy rolling updates
+        it may differ from the one specified in the stateful set.
+        '''
+        pod = self.api.core_v1.list_namespaced_pod(
+            namespace, label_selector="statefulset.kubernetes.io/pod-name=" + pod_name)
+        return pod.items[0].spec.containers[0].image
 
 
 if __name__ == '__main__':

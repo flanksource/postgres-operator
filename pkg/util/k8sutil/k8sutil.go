@@ -1,14 +1,18 @@
 package k8sutil
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
 	b64 "encoding/base64"
+	"encoding/json"
 
 	batchv1beta1 "k8s.io/api/batch/v1beta1"
 	clientbatchv1beta1 "k8s.io/client-go/kubernetes/typed/batch/v1beta1"
 
+	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
+	"github.com/zalando/postgres-operator/pkg/spec"
 	apiappsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	policybeta1 "k8s.io/api/policy/v1beta1"
@@ -44,6 +48,7 @@ type KubernetesClient struct {
 	corev1.NodesGetter
 	corev1.NamespacesGetter
 	corev1.ServiceAccountsGetter
+	corev1.EventsGetter
 	appsv1.StatefulSetsGetter
 	appsv1.DeploymentsGetter
 	rbacv1.RoleBindingsGetter
@@ -141,6 +146,7 @@ func NewFromConfig(cfg *rest.Config) (KubernetesClient, error) {
 	kubeClient.RESTClient = client.CoreV1().RESTClient()
 	kubeClient.RoleBindingsGetter = client.RbacV1()
 	kubeClient.CronJobsGetter = client.BatchV1beta1()
+	kubeClient.EventsGetter = client.CoreV1()
 
 	apiextClient, err := apiextclient.NewForConfig(cfg)
 	if err != nil {
@@ -151,6 +157,33 @@ func NewFromConfig(cfg *rest.Config) (KubernetesClient, error) {
 	kubeClient.AcidV1ClientSet = acidv1client.NewForConfigOrDie(cfg)
 
 	return kubeClient, nil
+}
+
+// SetPostgresCRDStatus of Postgres cluster
+func (client *KubernetesClient) SetPostgresCRDStatus(clusterName spec.NamespacedName, status string) (*acidv1.Postgresql, error) {
+	var pg *acidv1.Postgresql
+	var pgStatus acidv1.PostgresStatus
+	pgStatus.PostgresClusterStatus = status
+
+	patch, err := json.Marshal(struct {
+		PgStatus interface{} `json:"status"`
+	}{&pgStatus})
+
+	if err != nil {
+		return pg, fmt.Errorf("could not marshal status: %v", err)
+	}
+
+	// we cannot do a full scale update here without fetching the previous manifest (as the resourceVersion may differ),
+	// however, we could do patch without it. In the future, once /status subresource is there (starting Kubernetes 1.11)
+	// we should take advantage of it.
+	pg, err = client.AcidV1ClientSet.AcidV1().Postgresqls(clusterName.Namespace).Patch(
+		context.TODO(), clusterName.Name, types.MergePatchType, patch, metav1.PatchOptions{}, "status")
+	if err != nil {
+		return pg, fmt.Errorf("could not update status: %v", err)
+	}
+
+	// update the spec, maintaining the new resourceVersion.
+	return pg, nil
 }
 
 // SameService compares the Services
@@ -237,32 +270,74 @@ func SameLogicalBackupJob(cur, new *batchv1beta1.CronJob) (match bool, reason st
 	return true, ""
 }
 
-func (c *mockSecret) Get(name string, options metav1.GetOptions) (*v1.Secret, error) {
-	if name != "infrastructureroles-test" {
-		return nil, fmt.Errorf("NotFound")
-	}
-	secret := &v1.Secret{}
-	secret.Name = "testcluster"
-	secret.Data = map[string][]byte{
+func (c *mockSecret) Get(ctx context.Context, name string, options metav1.GetOptions) (*v1.Secret, error) {
+	oldFormatSecret := &v1.Secret{}
+	oldFormatSecret.Name = "testcluster"
+	oldFormatSecret.Data = map[string][]byte{
 		"user1":     []byte("testrole"),
 		"password1": []byte("testpassword"),
 		"inrole1":   []byte("testinrole"),
 		"foobar":    []byte(b64.StdEncoding.EncodeToString([]byte("password"))),
 	}
-	return secret, nil
+
+	newFormatSecret := &v1.Secret{}
+	newFormatSecret.Name = "test-secret-new-format"
+	newFormatSecret.Data = map[string][]byte{
+		"user":       []byte("new-test-role"),
+		"password":   []byte("new-test-password"),
+		"inrole":     []byte("new-test-inrole"),
+		"new-foobar": []byte(b64.StdEncoding.EncodeToString([]byte("password"))),
+	}
+
+	secrets := map[string]*v1.Secret{
+		"infrastructureroles-old-test": oldFormatSecret,
+		"infrastructureroles-new-test": newFormatSecret,
+	}
+
+	for idx := 1; idx <= 2; idx++ {
+		newFormatStandaloneSecret := &v1.Secret{}
+		newFormatStandaloneSecret.Name = fmt.Sprintf("test-secret-new-format%d", idx)
+		newFormatStandaloneSecret.Data = map[string][]byte{
+			"user":     []byte(fmt.Sprintf("new-test-role%d", idx)),
+			"password": []byte(fmt.Sprintf("new-test-password%d", idx)),
+			"inrole":   []byte(fmt.Sprintf("new-test-inrole%d", idx)),
+		}
+
+		secrets[fmt.Sprintf("infrastructureroles-new-test%d", idx)] =
+			newFormatStandaloneSecret
+	}
+
+	if secret, exists := secrets[name]; exists {
+		return secret, nil
+	}
+
+	return nil, fmt.Errorf("NotFound")
 
 }
 
-func (c *mockConfigMap) Get(name string, options metav1.GetOptions) (*v1.ConfigMap, error) {
-	if name != "infrastructureroles-test" {
-		return nil, fmt.Errorf("NotFound")
-	}
-	configmap := &v1.ConfigMap{}
-	configmap.Name = "testcluster"
-	configmap.Data = map[string]string{
+func (c *mockConfigMap) Get(ctx context.Context, name string, options metav1.GetOptions) (*v1.ConfigMap, error) {
+	oldFormatConfigmap := &v1.ConfigMap{}
+	oldFormatConfigmap.Name = "testcluster"
+	oldFormatConfigmap.Data = map[string]string{
 		"foobar": "{}",
 	}
-	return configmap, nil
+
+	newFormatConfigmap := &v1.ConfigMap{}
+	newFormatConfigmap.Name = "testcluster"
+	newFormatConfigmap.Data = map[string]string{
+		"new-foobar": "{\"user_flags\": [\"createdb\"]}",
+	}
+
+	configmaps := map[string]*v1.ConfigMap{
+		"infrastructureroles-old-test": oldFormatConfigmap,
+		"infrastructureroles-new-test": newFormatConfigmap,
+	}
+
+	if configmap, exists := configmaps[name]; exists {
+		return configmap, nil
+	}
+
+	return nil, fmt.Errorf("NotFound")
 }
 
 // Secrets to be mocked
@@ -283,7 +358,7 @@ func (mock *MockDeploymentNotExistGetter) Deployments(namespace string) appsv1.D
 	return &mockDeploymentNotExist{}
 }
 
-func (mock *mockDeployment) Create(*apiappsv1.Deployment) (*apiappsv1.Deployment, error) {
+func (mock *mockDeployment) Create(context.Context, *apiappsv1.Deployment, metav1.CreateOptions) (*apiappsv1.Deployment, error) {
 	return &apiappsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-deployment",
@@ -294,11 +369,11 @@ func (mock *mockDeployment) Create(*apiappsv1.Deployment) (*apiappsv1.Deployment
 	}, nil
 }
 
-func (mock *mockDeployment) Delete(name string, opts *metav1.DeleteOptions) error {
+func (mock *mockDeployment) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
 	return nil
 }
 
-func (mock *mockDeployment) Get(name string, opts metav1.GetOptions) (*apiappsv1.Deployment, error) {
+func (mock *mockDeployment) Get(ctx context.Context, name string, opts metav1.GetOptions) (*apiappsv1.Deployment, error) {
 	return &apiappsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-deployment",
@@ -318,7 +393,7 @@ func (mock *mockDeployment) Get(name string, opts metav1.GetOptions) (*apiappsv1
 	}, nil
 }
 
-func (mock *mockDeployment) Patch(name string, t types.PatchType, data []byte, subres ...string) (*apiappsv1.Deployment, error) {
+func (mock *mockDeployment) Patch(ctx context.Context, name string, t types.PatchType, data []byte, opts metav1.PatchOptions, subres ...string) (*apiappsv1.Deployment, error) {
 	return &apiappsv1.Deployment{
 		Spec: apiappsv1.DeploymentSpec{
 			Replicas: Int32ToPointer(2),
@@ -329,7 +404,7 @@ func (mock *mockDeployment) Patch(name string, t types.PatchType, data []byte, s
 	}, nil
 }
 
-func (mock *mockDeploymentNotExist) Get(name string, opts metav1.GetOptions) (*apiappsv1.Deployment, error) {
+func (mock *mockDeploymentNotExist) Get(ctx context.Context, name string, opts metav1.GetOptions) (*apiappsv1.Deployment, error) {
 	return nil, &apierrors.StatusError{
 		ErrStatus: metav1.Status{
 			Reason: metav1.StatusReasonNotFound,
@@ -337,7 +412,7 @@ func (mock *mockDeploymentNotExist) Get(name string, opts metav1.GetOptions) (*a
 	}
 }
 
-func (mock *mockDeploymentNotExist) Create(*apiappsv1.Deployment) (*apiappsv1.Deployment, error) {
+func (mock *mockDeploymentNotExist) Create(context.Context, *apiappsv1.Deployment, metav1.CreateOptions) (*apiappsv1.Deployment, error) {
 	return &apiappsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-deployment",
@@ -356,7 +431,7 @@ func (mock *MockServiceNotExistGetter) Services(namespace string) corev1.Service
 	return &mockServiceNotExist{}
 }
 
-func (mock *mockService) Create(*v1.Service) (*v1.Service, error) {
+func (mock *mockService) Create(context.Context, *v1.Service, metav1.CreateOptions) (*v1.Service, error) {
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-service",
@@ -364,11 +439,11 @@ func (mock *mockService) Create(*v1.Service) (*v1.Service, error) {
 	}, nil
 }
 
-func (mock *mockService) Delete(name string, opts *metav1.DeleteOptions) error {
+func (mock *mockService) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
 	return nil
 }
 
-func (mock *mockService) Get(name string, opts metav1.GetOptions) (*v1.Service, error) {
+func (mock *mockService) Get(ctx context.Context, name string, opts metav1.GetOptions) (*v1.Service, error) {
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-service",
@@ -376,7 +451,7 @@ func (mock *mockService) Get(name string, opts metav1.GetOptions) (*v1.Service, 
 	}, nil
 }
 
-func (mock *mockServiceNotExist) Create(*v1.Service) (*v1.Service, error) {
+func (mock *mockServiceNotExist) Create(context.Context, *v1.Service, metav1.CreateOptions) (*v1.Service, error) {
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-service",
@@ -384,7 +459,7 @@ func (mock *mockServiceNotExist) Create(*v1.Service) (*v1.Service, error) {
 	}, nil
 }
 
-func (mock *mockServiceNotExist) Get(name string, opts metav1.GetOptions) (*v1.Service, error) {
+func (mock *mockServiceNotExist) Get(ctx context.Context, name string, opts metav1.GetOptions) (*v1.Service, error) {
 	return nil, &apierrors.StatusError{
 		ErrStatus: metav1.Status{
 			Reason: metav1.StatusReasonNotFound,

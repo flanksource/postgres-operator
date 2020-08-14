@@ -31,7 +31,8 @@ const (
 	RoleOriginInfrastructure
 	RoleOriginTeamsAPI
 	RoleOriginSystem
-	RoleConnectionPool
+	RoleOriginBootstrap
+	RoleConnectionPooler
 )
 
 type syncUserOperation int
@@ -52,6 +53,10 @@ type PgUser struct {
 	MemberOf   []string          `yaml:"inrole"`
 	Parameters map[string]string `yaml:"db_parameters"`
 	AdminRole  string            `yaml:"admin_role"`
+}
+
+func (user *PgUser) Valid() bool {
+	return user.Name != "" && user.Password != ""
 }
 
 // PgUserMap maps user names to the definitions.
@@ -180,8 +185,10 @@ func (r RoleOrigin) String() string {
 		return "teams API role"
 	case RoleOriginSystem:
 		return "system role"
-	case RoleConnectionPool:
-		return "connection pool role"
+	case RoleOriginBootstrap:
+		return "bootstrapped role"
+	case RoleConnectionPooler:
+		return "connection pooler role"
 	default:
 		panic(fmt.Sprintf("bogus role origin value %d", r))
 	}

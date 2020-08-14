@@ -1,12 +1,10 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
-
-	batchv1beta1 "k8s.io/api/batch/v1beta1"
-	v1 "k8s.io/api/core/v1"
-	policybeta1 "k8s.io/api/policy/v1beta1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"regexp"
+	"strings"
 
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
 	"github.com/zalando/postgres-operator/pkg/spec"
@@ -14,6 +12,11 @@ import (
 	"github.com/zalando/postgres-operator/pkg/util/constants"
 	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
 	"github.com/zalando/postgres-operator/pkg/util/volumes"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1beta1 "k8s.io/api/batch/v1beta1"
+	v1 "k8s.io/api/core/v1"
+	policybeta1 "k8s.io/api/policy/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Sync syncs the cluster, making sure the actual Kubernetes objects correspond to what is defined in the manifest.
@@ -29,9 +32,9 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 	defer func() {
 		if err != nil {
 			c.logger.Warningf("error while syncing cluster state: %v", err)
-			c.setStatus(acidv1.ClusterStatusSyncFailed)
+			c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusSyncFailed)
 		} else if !c.Status.Running() {
-			c.setStatus(acidv1.ClusterStatusRunning)
+			c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusRunning)
 		}
 	}()
 
@@ -54,16 +57,26 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 		return err
 	}
 
-	// potentially enlarge volumes before changing the statefulset. By doing that
-	// in this order we make sure the operator is not stuck waiting for a pod that
-	// cannot start because it ran out of disk space.
-	// TODO: handle the case of the cluster that is downsized and enlarged again
-	// (there will be a volume from the old pod for which we can't act before the
-	//  the statefulset modification is concluded)
-	c.logger.Debugf("syncing persistent volumes")
-	if err = c.syncVolumes(); err != nil {
-		err = fmt.Errorf("could not sync persistent volumes: %v", err)
-		return err
+	if c.OpConfig.StorageResizeMode == "pvc" {
+		c.logger.Debugf("syncing persistent volume claims")
+		if err = c.syncVolumeClaims(); err != nil {
+			err = fmt.Errorf("could not sync persistent volume claims: %v", err)
+			return err
+		}
+	} else if c.OpConfig.StorageResizeMode == "ebs" {
+		// potentially enlarge volumes before changing the statefulset. By doing that
+		// in this order we make sure the operator is not stuck waiting for a pod that
+		// cannot start because it ran out of disk space.
+		// TODO: handle the case of the cluster that is downsized and enlarged again
+		// (there will be a volume from the old pod for which we can't act before the
+		//  the statefulset modification is concluded)
+		c.logger.Debugf("syncing persistent volumes")
+		if err = c.syncVolumes(); err != nil {
+			err = fmt.Errorf("could not sync persistent volumes: %v", err)
+			return err
+		}
+	} else {
+		c.logger.Infof("Storage resize is disabled (storage_resize_mode is off). Skipping volume sync.")
 	}
 
 	if err = c.enforceMinResourceLimits(&c.Spec); err != nil {
@@ -107,11 +120,16 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 			err = fmt.Errorf("could not sync databases: %v", err)
 			return err
 		}
+		c.logger.Debugf("syncing prepared databases with schemas")
+		if err = c.syncPreparedDatabases(); err != nil {
+			err = fmt.Errorf("could not sync prepared database: %v", err)
+			return err
+		}
 	}
 
-	// sync connection pool
-	if err = c.syncConnectionPool(&oldSpec, newSpec, c.installLookupFunction); err != nil {
-		return fmt.Errorf("could not sync connection pool: %v", err)
+	// sync connection pooler
+	if _, err = c.syncConnectionPooler(&oldSpec, newSpec, c.installLookupFunction); err != nil {
+		return fmt.Errorf("could not sync connection pooler: %v", err)
 	}
 
 	return err
@@ -121,10 +139,11 @@ func (c *Cluster) syncServices() error {
 	for _, role := range []PostgresRole{Master, Replica} {
 		c.logger.Debugf("syncing %s service", role)
 
-		if err := c.syncEndpoint(role); err != nil {
-			return fmt.Errorf("could not sync %s endpoint: %v", role, err)
+		if !c.patroniKubernetesUseConfigMaps() {
+			if err := c.syncEndpoint(role); err != nil {
+				return fmt.Errorf("could not sync %s endpoint: %v", role, err)
+			}
 		}
-
 		if err := c.syncService(role); err != nil {
 			return fmt.Errorf("could not sync %s service: %v", role, err)
 		}
@@ -140,7 +159,7 @@ func (c *Cluster) syncService(role PostgresRole) error {
 	)
 	c.setProcessName("syncing %s service", role)
 
-	if svc, err = c.KubeClient.Services(c.Namespace).Get(c.serviceName(role), metav1.GetOptions{}); err == nil {
+	if svc, err = c.KubeClient.Services(c.Namespace).Get(context.TODO(), c.serviceName(role), metav1.GetOptions{}); err == nil {
 		c.Services[role] = svc
 		desiredSvc := c.generateService(role, &c.Spec)
 		if match, reason := k8sutil.SameService(svc, desiredSvc); !match {
@@ -166,7 +185,7 @@ func (c *Cluster) syncService(role PostgresRole) error {
 			return fmt.Errorf("could not create missing %s service: %v", role, err)
 		}
 		c.logger.Infof("%s service %q already exists", role, util.NameFromMeta(svc.ObjectMeta))
-		if svc, err = c.KubeClient.Services(c.Namespace).Get(c.serviceName(role), metav1.GetOptions{}); err != nil {
+		if svc, err = c.KubeClient.Services(c.Namespace).Get(context.TODO(), c.serviceName(role), metav1.GetOptions{}); err != nil {
 			return fmt.Errorf("could not fetch existing %s service: %v", role, err)
 		}
 	}
@@ -181,7 +200,7 @@ func (c *Cluster) syncEndpoint(role PostgresRole) error {
 	)
 	c.setProcessName("syncing %s endpoint", role)
 
-	if ep, err = c.KubeClient.Endpoints(c.Namespace).Get(c.endpointName(role), metav1.GetOptions{}); err == nil {
+	if ep, err = c.KubeClient.Endpoints(c.Namespace).Get(context.TODO(), c.endpointName(role), metav1.GetOptions{}); err == nil {
 		// TODO: No syncing of endpoints here, is this covered completely by updateService?
 		c.Endpoints[role] = ep
 		return nil
@@ -200,7 +219,7 @@ func (c *Cluster) syncEndpoint(role PostgresRole) error {
 			return fmt.Errorf("could not create missing %s endpoint: %v", role, err)
 		}
 		c.logger.Infof("%s endpoint %q already exists", role, util.NameFromMeta(ep.ObjectMeta))
-		if ep, err = c.KubeClient.Endpoints(c.Namespace).Get(c.endpointName(role), metav1.GetOptions{}); err != nil {
+		if ep, err = c.KubeClient.Endpoints(c.Namespace).Get(context.TODO(), c.endpointName(role), metav1.GetOptions{}); err != nil {
 			return fmt.Errorf("could not fetch existing %s endpoint: %v", role, err)
 		}
 	}
@@ -213,7 +232,7 @@ func (c *Cluster) syncPodDisruptionBudget(isUpdate bool) error {
 		pdb *policybeta1.PodDisruptionBudget
 		err error
 	)
-	if pdb, err = c.KubeClient.PodDisruptionBudgets(c.Namespace).Get(c.podDisruptionBudgetName(), metav1.GetOptions{}); err == nil {
+	if pdb, err = c.KubeClient.PodDisruptionBudgets(c.Namespace).Get(context.TODO(), c.podDisruptionBudgetName(), metav1.GetOptions{}); err == nil {
 		c.PodDisruptionBudget = pdb
 		newPDB := c.generatePodDisruptionBudget()
 		if match, reason := k8sutil.SamePDB(pdb, newPDB); !match {
@@ -239,7 +258,7 @@ func (c *Cluster) syncPodDisruptionBudget(isUpdate bool) error {
 			return fmt.Errorf("could not create pod disruption budget: %v", err)
 		}
 		c.logger.Infof("pod disruption budget %q already exists", util.NameFromMeta(pdb.ObjectMeta))
-		if pdb, err = c.KubeClient.PodDisruptionBudgets(c.Namespace).Get(c.podDisruptionBudgetName(), metav1.GetOptions{}); err != nil {
+		if pdb, err = c.KubeClient.PodDisruptionBudgets(c.Namespace).Get(context.TODO(), c.podDisruptionBudgetName(), metav1.GetOptions{}); err != nil {
 			return fmt.Errorf("could not fetch existing %q pod disruption budget", util.NameFromMeta(pdb.ObjectMeta))
 		}
 	}
@@ -250,12 +269,34 @@ func (c *Cluster) syncPodDisruptionBudget(isUpdate bool) error {
 	return nil
 }
 
+func (c *Cluster) mustUpdatePodsAfterLazyUpdate(desiredSset *appsv1.StatefulSet) (bool, error) {
+
+	pods, err := c.listPods()
+	if err != nil {
+		return false, fmt.Errorf("could not list pods of the statefulset: %v", err)
+	}
+
+	for _, pod := range pods {
+
+		effectivePodImage := pod.Spec.Containers[0].Image
+		ssImage := desiredSset.Spec.Template.Spec.Containers[0].Image
+
+		if ssImage != effectivePodImage {
+			c.logger.Infof("not all pods were re-started when the lazy upgrade was enabled; forcing the rolling upgrade now")
+			return true, nil
+		}
+
+	}
+
+	return false, nil
+}
+
 func (c *Cluster) syncStatefulSet() error {
 	var (
 		podsRollingUpdateRequired bool
 	)
 	// NB: Be careful to consider the codepath that acts on podsRollingUpdateRequired before returning early.
-	sset, err := c.KubeClient.StatefulSets(c.Namespace).Get(c.statefulSetName(), metav1.GetOptions{})
+	sset, err := c.KubeClient.StatefulSets(c.Namespace).Get(context.TODO(), c.statefulSetName(), metav1.GetOptions{})
 	if err != nil {
 		if !k8sutil.ResourceNotFound(err) {
 			return fmt.Errorf("could not get statefulset: %v", err)
@@ -328,6 +369,21 @@ func (c *Cluster) syncStatefulSet() error {
 				}
 			}
 		}
+		annotations := c.AnnotationsToPropagate(c.Statefulset.Annotations)
+		c.updateStatefulSetAnnotations(annotations)
+
+		if !podsRollingUpdateRequired && !c.OpConfig.EnableLazySpiloUpgrade {
+			// even if desired and actual statefulsets match
+			// there still may be not up-to-date pods on condition
+			//  (a) the lazy update was just disabled
+			// and
+			//  (b) some of the pods were not restarted when the lazy update was still in place
+			podsRollingUpdateRequired, err = c.mustUpdatePodsAfterLazyUpdate(desiredSS)
+			if err != nil {
+				return fmt.Errorf("could not list pods of the statefulset: %v", err)
+			}
+		}
+
 	}
 
 	// Apply special PostgreSQL parameters that can only be set via the Patroni API.
@@ -341,15 +397,41 @@ func (c *Cluster) syncStatefulSet() error {
 	// statefulset or those that got their configuration from the outdated statefulset)
 	if podsRollingUpdateRequired {
 		c.logger.Debugln("performing rolling update")
+		c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Update", "Performing rolling update")
 		if err := c.recreatePods(); err != nil {
 			return fmt.Errorf("could not recreate pods: %v", err)
 		}
 		c.logger.Infof("pods have been recreated")
+		c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Update", "Rolling update done - pods have been recreated")
 		if err := c.applyRollingUpdateFlagforStatefulSet(false); err != nil {
 			c.logger.Warningf("could not clear rolling update for the statefulset: %v", err)
 		}
 	}
 	return nil
+}
+
+// AnnotationsToPropagate get the annotations to update if required
+// based on the annotations in postgres CRD
+func (c *Cluster) AnnotationsToPropagate(annotations map[string]string) map[string]string {
+	toPropagateAnnotations := c.OpConfig.DownscalerAnnotations
+	pgCRDAnnotations := c.Postgresql.ObjectMeta.GetAnnotations()
+
+	if toPropagateAnnotations != nil && pgCRDAnnotations != nil {
+		for _, anno := range toPropagateAnnotations {
+			for k, v := range pgCRDAnnotations {
+				matched, err := regexp.MatchString(anno, k)
+				if err != nil {
+					c.logger.Errorf("annotations matching issue: %v", err)
+					return nil
+				}
+				if matched {
+					annotations[k] = v
+				}
+			}
+		}
+	}
+
+	return annotations
 }
 
 // checkAndSetGlobalPostgreSQLConfiguration checks whether cluster-wide API parameters
@@ -404,20 +486,21 @@ func (c *Cluster) syncSecrets() error {
 	secrets := c.generateUserSecrets()
 
 	for secretUsername, secretSpec := range secrets {
-		if secret, err = c.KubeClient.Secrets(secretSpec.Namespace).Create(secretSpec); err == nil {
+		if secret, err = c.KubeClient.Secrets(secretSpec.Namespace).Create(context.TODO(), secretSpec, metav1.CreateOptions{}); err == nil {
 			c.Secrets[secret.UID] = secret
 			c.logger.Debugf("created new secret %q, uid: %q", util.NameFromMeta(secret.ObjectMeta), secret.UID)
 			continue
 		}
 		if k8sutil.ResourceAlreadyExists(err) {
 			var userMap map[string]spec.PgUser
-			if secret, err = c.KubeClient.Secrets(secretSpec.Namespace).Get(secretSpec.Name, metav1.GetOptions{}); err != nil {
+			if secret, err = c.KubeClient.Secrets(secretSpec.Namespace).Get(context.TODO(), secretSpec.Name, metav1.GetOptions{}); err != nil {
 				return fmt.Errorf("could not get current secret: %v", err)
 			}
 			if secretUsername != string(secret.Data["username"]) {
 				c.logger.Warningf("secret %q does not contain the role %q", secretSpec.Name, secretUsername)
 				continue
 			}
+			c.Secrets[secret.UID] = secret
 			c.logger.Debugf("secret %q already exists, fetching its password", util.NameFromMeta(secret.ObjectMeta))
 			if secretUsername == c.systemUsers[constants.SuperuserKeyName].Name {
 				secretUsername = constants.SuperuserKeyName
@@ -434,7 +517,7 @@ func (c *Cluster) syncSecrets() error {
 				pwdUser.Origin == spec.RoleOriginInfrastructure {
 
 				c.logger.Debugf("updating the secret %q from the infrastructure roles", secretSpec.Name)
-				if _, err = c.KubeClient.Secrets(secretSpec.Namespace).Update(secretSpec); err != nil {
+				if _, err = c.KubeClient.Secrets(secretSpec.Namespace).Update(context.TODO(), secretSpec, metav1.UpdateOptions{}); err != nil {
 					return fmt.Errorf("could not update infrastructure role secret for role %q: %v", secretUsername, err)
 				}
 			} else {
@@ -477,12 +560,12 @@ func (c *Cluster) syncRoles() (err error) {
 		userNames = append(userNames, u.Name)
 	}
 
-	if c.needConnectionPool() {
-		connPoolUser := c.systemUsers[constants.ConnectionPoolUserKeyName]
-		userNames = append(userNames, connPoolUser.Name)
+	if c.needConnectionPooler() {
+		connectionPoolerUser := c.systemUsers[constants.ConnectionPoolerUserKeyName]
+		userNames = append(userNames, connectionPoolerUser.Name)
 
-		if _, exists := c.pgUsers[connPoolUser.Name]; !exists {
-			c.pgUsers[connPoolUser.Name] = connPoolUser
+		if _, exists := c.pgUsers[connectionPoolerUser.Name]; !exists {
+			c.pgUsers[connectionPoolerUser.Name] = connectionPoolerUser
 		}
 	}
 
@@ -495,6 +578,27 @@ func (c *Cluster) syncRoles() (err error) {
 	if err = c.userSyncStrategy.ExecuteSyncRequests(pgSyncRequests, c.pgDb); err != nil {
 		return fmt.Errorf("error executing sync statements: %v", err)
 	}
+
+	return nil
+}
+
+// syncVolumeClaims reads all persistent volume claims and checks that their size matches the one declared in the statefulset.
+func (c *Cluster) syncVolumeClaims() error {
+	c.setProcessName("syncing volume claims")
+
+	act, err := c.volumeClaimsNeedResizing(c.Spec.Volume)
+	if err != nil {
+		return fmt.Errorf("could not compare size of the volume claims: %v", err)
+	}
+	if !act {
+		c.logger.Infof("volume claims don't require changes")
+		return nil
+	}
+	if err := c.resizeVolumeClaims(c.Spec.Volume); err != nil {
+		return fmt.Errorf("could not sync volume claims: %v", err)
+	}
+
+	c.logger.Infof("volume claims have been synced successfully")
 
 	return nil
 }
@@ -524,6 +628,7 @@ func (c *Cluster) syncDatabases() error {
 
 	createDatabases := make(map[string]string)
 	alterOwnerDatabases := make(map[string]string)
+	preparedDatabases := make([]string, 0)
 
 	if err := c.initDbConn(); err != nil {
 		return fmt.Errorf("could not init database connection")
@@ -539,12 +644,24 @@ func (c *Cluster) syncDatabases() error {
 		return fmt.Errorf("could not get current databases: %v", err)
 	}
 
-	for datname, newOwner := range c.Spec.Databases {
-		currentOwner, exists := currentDatabases[datname]
+	// if no prepared databases are specified create a database named like the cluster
+	if c.Spec.PreparedDatabases != nil && len(c.Spec.PreparedDatabases) == 0 { // TODO: add option to disable creating such a default DB
+		c.Spec.PreparedDatabases = map[string]acidv1.PreparedDatabase{strings.Replace(c.Name, "-", "_", -1): {}}
+	}
+	for preparedDatabaseName := range c.Spec.PreparedDatabases {
+		_, exists := currentDatabases[preparedDatabaseName]
 		if !exists {
-			createDatabases[datname] = newOwner
+			createDatabases[preparedDatabaseName] = preparedDatabaseName + constants.OwnerRoleNameSuffix
+			preparedDatabases = append(preparedDatabases, preparedDatabaseName)
+		}
+	}
+
+	for databaseName, newOwner := range c.Spec.Databases {
+		currentOwner, exists := currentDatabases[databaseName]
+		if !exists {
+			createDatabases[databaseName] = newOwner
 		} else if currentOwner != newOwner {
-			alterOwnerDatabases[datname] = newOwner
+			alterOwnerDatabases[databaseName] = newOwner
 		}
 	}
 
@@ -552,13 +669,116 @@ func (c *Cluster) syncDatabases() error {
 		return nil
 	}
 
-	for datname, owner := range createDatabases {
-		if err = c.executeCreateDatabase(datname, owner); err != nil {
+	for databaseName, owner := range createDatabases {
+		if err = c.executeCreateDatabase(databaseName, owner); err != nil {
 			return err
 		}
 	}
-	for datname, owner := range alterOwnerDatabases {
-		if err = c.executeAlterDatabaseOwner(datname, owner); err != nil {
+	for databaseName, owner := range alterOwnerDatabases {
+		if err = c.executeAlterDatabaseOwner(databaseName, owner); err != nil {
+			return err
+		}
+	}
+
+	// set default privileges for prepared database
+	for _, preparedDatabase := range preparedDatabases {
+		if err = c.execAlterGlobalDefaultPrivileges(preparedDatabase+constants.OwnerRoleNameSuffix, preparedDatabase); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Cluster) syncPreparedDatabases() error {
+	c.setProcessName("syncing prepared databases")
+	for preparedDbName, preparedDB := range c.Spec.PreparedDatabases {
+		if err := c.initDbConnWithName(preparedDbName); err != nil {
+			return fmt.Errorf("could not init connection to database %s: %v", preparedDbName, err)
+		}
+		defer func() {
+			if err := c.closeDbConn(); err != nil {
+				c.logger.Errorf("could not close database connection: %v", err)
+			}
+		}()
+
+		// now, prepare defined schemas
+		preparedSchemas := preparedDB.PreparedSchemas
+		if len(preparedDB.PreparedSchemas) == 0 {
+			preparedSchemas = map[string]acidv1.PreparedSchema{"data": {DefaultRoles: util.True()}}
+		}
+		if err := c.syncPreparedSchemas(preparedDbName, preparedSchemas); err != nil {
+			return err
+		}
+
+		// install extensions
+		if err := c.syncExtensions(preparedDB.Extensions); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Cluster) syncPreparedSchemas(databaseName string, preparedSchemas map[string]acidv1.PreparedSchema) error {
+	c.setProcessName("syncing prepared schemas")
+
+	currentSchemas, err := c.getSchemas()
+	if err != nil {
+		return fmt.Errorf("could not get current schemas: %v", err)
+	}
+
+	var schemas []string
+
+	for schema := range preparedSchemas {
+		schemas = append(schemas, schema)
+	}
+
+	if createPreparedSchemas, equal := util.SubstractStringSlices(schemas, currentSchemas); !equal {
+		for _, schemaName := range createPreparedSchemas {
+			owner := constants.OwnerRoleNameSuffix
+			dbOwner := databaseName + owner
+			if preparedSchemas[schemaName].DefaultRoles == nil || *preparedSchemas[schemaName].DefaultRoles {
+				owner = databaseName + "_" + schemaName + owner
+			} else {
+				owner = dbOwner
+			}
+			if err = c.executeCreateDatabaseSchema(databaseName, schemaName, dbOwner, owner); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *Cluster) syncExtensions(extensions map[string]string) error {
+	c.setProcessName("syncing database extensions")
+
+	createExtensions := make(map[string]string)
+	alterExtensions := make(map[string]string)
+
+	currentExtensions, err := c.getExtensions()
+	if err != nil {
+		return fmt.Errorf("could not get current database extensions: %v", err)
+	}
+
+	for extName, newSchema := range extensions {
+		currentSchema, exists := currentExtensions[extName]
+		if !exists {
+			createExtensions[extName] = newSchema
+		} else if currentSchema != newSchema {
+			alterExtensions[extName] = newSchema
+		}
+	}
+
+	for extName, schema := range createExtensions {
+		if err = c.executeCreateExtension(extName, schema); err != nil {
+			return err
+		}
+	}
+	for extName, schema := range alterExtensions {
+		if err = c.executeAlterExtension(extName, schema); err != nil {
 			return err
 		}
 	}
@@ -577,7 +797,7 @@ func (c *Cluster) syncLogicalBackupJob() error {
 	// sync the job if it exists
 
 	jobName := c.getLogicalBackupJobName()
-	if job, err = c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Get(jobName, metav1.GetOptions{}); err == nil {
+	if job, err = c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Get(context.TODO(), jobName, metav1.GetOptions{}); err == nil {
 
 		desiredJob, err = c.generateLogicalBackupJob()
 		if err != nil {
@@ -611,7 +831,7 @@ func (c *Cluster) syncLogicalBackupJob() error {
 			return fmt.Errorf("could not create missing logical backup job: %v", err)
 		}
 		c.logger.Infof("logical backup job %q already exists", jobName)
-		if _, err = c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Get(jobName, metav1.GetOptions{}); err != nil {
+		if _, err = c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Get(context.TODO(), jobName, metav1.GetOptions{}); err != nil {
 			return fmt.Errorf("could not fetch existing logical backup job: %v", err)
 		}
 	}
@@ -619,164 +839,195 @@ func (c *Cluster) syncLogicalBackupJob() error {
 	return nil
 }
 
-func (c *Cluster) syncConnectionPool(oldSpec, newSpec *acidv1.Postgresql, lookup InstallFunction) error {
-	if c.ConnectionPool == nil {
-		c.ConnectionPool = &ConnectionPoolObjects{}
+func (c *Cluster) syncConnectionPooler(oldSpec,
+	newSpec *acidv1.Postgresql,
+	lookup InstallFunction) (SyncReason, error) {
+
+	var reason SyncReason
+	var err error
+
+	if c.ConnectionPooler == nil {
+		c.ConnectionPooler = &ConnectionPoolerObjects{}
 	}
 
-	newNeedConnPool := c.needConnectionPoolWorker(&newSpec.Spec)
-	oldNeedConnPool := c.needConnectionPoolWorker(&oldSpec.Spec)
+	newNeedConnectionPooler := c.needConnectionPoolerWorker(&newSpec.Spec)
+	oldNeedConnectionPooler := c.needConnectionPoolerWorker(&oldSpec.Spec)
 
-	if newNeedConnPool {
-		// Try to sync in any case. If we didn't needed connection pool before,
+	if newNeedConnectionPooler {
+		// Try to sync in any case. If we didn't needed connection pooler before,
 		// it means we want to create it. If it was already present, still sync
 		// since it could happen that there is no difference in specs, and all
-		// the resources are remembered, but the deployment was manualy deleted
+		// the resources are remembered, but the deployment was manually deleted
 		// in between
-		c.logger.Debug("syncing connection pool")
+		c.logger.Debug("syncing connection pooler")
 
 		// in this case also do not forget to install lookup function as for
 		// creating cluster
-		if !oldNeedConnPool || !c.ConnectionPool.LookupFunction {
-			newConnPool := newSpec.Spec.ConnectionPool
+		if !oldNeedConnectionPooler || !c.ConnectionPooler.LookupFunction {
+			newConnectionPooler := newSpec.Spec.ConnectionPooler
 
 			specSchema := ""
 			specUser := ""
 
-			if newConnPool != nil {
-				specSchema = newConnPool.Schema
-				specUser = newConnPool.User
+			if newConnectionPooler != nil {
+				specSchema = newConnectionPooler.Schema
+				specUser = newConnectionPooler.User
 			}
 
 			schema := util.Coalesce(
 				specSchema,
-				c.OpConfig.ConnectionPool.Schema)
+				c.OpConfig.ConnectionPooler.Schema)
 
 			user := util.Coalesce(
 				specUser,
-				c.OpConfig.ConnectionPool.User)
+				c.OpConfig.ConnectionPooler.User)
 
-			if err := lookup(schema, user); err != nil {
-				return err
+			if err = lookup(schema, user); err != nil {
+				return NoSync, err
 			}
 		}
 
-		if err := c.syncConnectionPoolWorker(oldSpec, newSpec); err != nil {
-			c.logger.Errorf("could not sync connection pool: %v", err)
-			return err
+		if reason, err = c.syncConnectionPoolerWorker(oldSpec, newSpec); err != nil {
+			c.logger.Errorf("could not sync connection pooler: %v", err)
+			return reason, err
 		}
 	}
 
-	if oldNeedConnPool && !newNeedConnPool {
+	if oldNeedConnectionPooler && !newNeedConnectionPooler {
 		// delete and cleanup resources
-		if err := c.deleteConnectionPool(); err != nil {
-			c.logger.Warningf("could not remove connection pool: %v", err)
+		if err = c.deleteConnectionPooler(); err != nil {
+			c.logger.Warningf("could not remove connection pooler: %v", err)
 		}
 	}
 
-	if !oldNeedConnPool && !newNeedConnPool {
+	if !oldNeedConnectionPooler && !newNeedConnectionPooler {
 		// delete and cleanup resources if not empty
-		if c.ConnectionPool != nil &&
-			(c.ConnectionPool.Deployment != nil ||
-				c.ConnectionPool.Service != nil) {
+		if c.ConnectionPooler != nil &&
+			(c.ConnectionPooler.Deployment != nil ||
+				c.ConnectionPooler.Service != nil) {
 
-			if err := c.deleteConnectionPool(); err != nil {
-				c.logger.Warningf("could not remove connection pool: %v", err)
+			if err = c.deleteConnectionPooler(); err != nil {
+				c.logger.Warningf("could not remove connection pooler: %v", err)
 			}
 		}
 	}
 
-	return nil
+	return reason, nil
 }
 
-// Synchronize connection pool resources. Effectively we're interested only in
+// Synchronize connection pooler resources. Effectively we're interested only in
 // synchronizing the corresponding deployment, but in case of deployment or
 // service is missing, create it. After checking, also remember an object for
 // the future references.
-func (c *Cluster) syncConnectionPoolWorker(oldSpec, newSpec *acidv1.Postgresql) error {
+func (c *Cluster) syncConnectionPoolerWorker(oldSpec, newSpec *acidv1.Postgresql) (
+	SyncReason, error) {
+
 	deployment, err := c.KubeClient.
 		Deployments(c.Namespace).
-		Get(c.connPoolName(), metav1.GetOptions{})
+		Get(context.TODO(), c.connectionPoolerName(), metav1.GetOptions{})
 
 	if err != nil && k8sutil.ResourceNotFound(err) {
-		msg := "Deployment %s for connection pool synchronization is not found, create it"
-		c.logger.Warningf(msg, c.connPoolName())
+		msg := "Deployment %s for connection pooler synchronization is not found, create it"
+		c.logger.Warningf(msg, c.connectionPoolerName())
 
-		deploymentSpec, err := c.generateConnPoolDeployment(&newSpec.Spec)
+		deploymentSpec, err := c.generateConnectionPoolerDeployment(&newSpec.Spec)
 		if err != nil {
-			msg = "could not generate deployment for connection pool: %v"
-			return fmt.Errorf(msg, err)
+			msg = "could not generate deployment for connection pooler: %v"
+			return NoSync, fmt.Errorf(msg, err)
 		}
 
 		deployment, err := c.KubeClient.
 			Deployments(deploymentSpec.Namespace).
-			Create(deploymentSpec)
+			Create(context.TODO(), deploymentSpec, metav1.CreateOptions{})
 
 		if err != nil {
-			return err
+			return NoSync, err
 		}
 
-		c.ConnectionPool.Deployment = deployment
+		c.ConnectionPooler.Deployment = deployment
 	} else if err != nil {
-		return fmt.Errorf("could not get connection pool deployment to sync: %v", err)
+		msg := "could not get connection pooler deployment to sync: %v"
+		return NoSync, fmt.Errorf(msg, err)
 	} else {
-		c.ConnectionPool.Deployment = deployment
+		c.ConnectionPooler.Deployment = deployment
 
 		// actual synchronization
-		oldConnPool := oldSpec.Spec.ConnectionPool
-		newConnPool := newSpec.Spec.ConnectionPool
-		specSync, specReason := c.needSyncConnPoolSpecs(oldConnPool, newConnPool)
-		defaultsSync, defaultsReason := c.needSyncConnPoolDefaults(newConnPool, deployment)
+		oldConnectionPooler := oldSpec.Spec.ConnectionPooler
+		newConnectionPooler := newSpec.Spec.ConnectionPooler
+
+		// sync implementation below assumes that both old and new specs are
+		// not nil, but it can happen. To avoid any confusion like updating a
+		// deployment because the specification changed from nil to an empty
+		// struct (that was initialized somewhere before) replace any nil with
+		// an empty spec.
+		if oldConnectionPooler == nil {
+			oldConnectionPooler = &acidv1.ConnectionPooler{}
+		}
+
+		if newConnectionPooler == nil {
+			newConnectionPooler = &acidv1.ConnectionPooler{}
+		}
+
+		c.logger.Infof("Old: %+v, New %+v", oldConnectionPooler, newConnectionPooler)
+
+		specSync, specReason := c.needSyncConnectionPoolerSpecs(oldConnectionPooler, newConnectionPooler)
+		defaultsSync, defaultsReason := c.needSyncConnectionPoolerDefaults(newConnectionPooler, deployment)
 		reason := append(specReason, defaultsReason...)
 		if specSync || defaultsSync {
-			c.logger.Infof("Update connection pool deployment %s, reason: %+v",
-				c.connPoolName(), reason)
+			c.logger.Infof("Update connection pooler deployment %s, reason: %+v",
+				c.connectionPoolerName(), reason)
 
-			newDeploymentSpec, err := c.generateConnPoolDeployment(&newSpec.Spec)
+			newDeploymentSpec, err := c.generateConnectionPoolerDeployment(&newSpec.Spec)
 			if err != nil {
-				msg := "could not generate deployment for connection pool: %v"
-				return fmt.Errorf(msg, err)
+				msg := "could not generate deployment for connection pooler: %v"
+				return reason, fmt.Errorf(msg, err)
 			}
 
-			oldDeploymentSpec := c.ConnectionPool.Deployment
+			oldDeploymentSpec := c.ConnectionPooler.Deployment
 
-			deployment, err := c.updateConnPoolDeployment(
+			deployment, err := c.updateConnectionPoolerDeployment(
 				oldDeploymentSpec,
 				newDeploymentSpec)
 
 			if err != nil {
-				return err
+				return reason, err
 			}
 
-			c.ConnectionPool.Deployment = deployment
-			return nil
+			c.ConnectionPooler.Deployment = deployment
+			return reason, nil
 		}
+	}
+
+	newAnnotations := c.AnnotationsToPropagate(c.ConnectionPooler.Deployment.Annotations)
+	if newAnnotations != nil {
+		c.updateConnectionPoolerAnnotations(newAnnotations)
 	}
 
 	service, err := c.KubeClient.
 		Services(c.Namespace).
-		Get(c.connPoolName(), metav1.GetOptions{})
+		Get(context.TODO(), c.connectionPoolerName(), metav1.GetOptions{})
 
 	if err != nil && k8sutil.ResourceNotFound(err) {
-		msg := "Service %s for connection pool synchronization is not found, create it"
-		c.logger.Warningf(msg, c.connPoolName())
+		msg := "Service %s for connection pooler synchronization is not found, create it"
+		c.logger.Warningf(msg, c.connectionPoolerName())
 
-		serviceSpec := c.generateConnPoolService(&newSpec.Spec)
+		serviceSpec := c.generateConnectionPoolerService(&newSpec.Spec)
 		service, err := c.KubeClient.
 			Services(serviceSpec.Namespace).
-			Create(serviceSpec)
+			Create(context.TODO(), serviceSpec, metav1.CreateOptions{})
 
 		if err != nil {
-			return err
+			return NoSync, err
 		}
 
-		c.ConnectionPool.Service = service
+		c.ConnectionPooler.Service = service
 	} else if err != nil {
-		return fmt.Errorf("could not get connection pool service to sync: %v", err)
+		msg := "could not get connection pooler service to sync: %v"
+		return NoSync, fmt.Errorf(msg, err)
 	} else {
 		// Service updates are not supported and probably not that useful anyway
-		c.ConnectionPool.Service = service
+		c.ConnectionPooler.Service = service
 	}
 
-	return nil
+	return NoSync, nil
 }
