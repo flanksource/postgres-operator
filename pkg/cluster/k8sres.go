@@ -1067,7 +1067,7 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 		c.Postgresql.GetUID(),
 		spiloConfiguration,
 		spec.Env,
-		&spec.Clone,
+		spec.Clone,
 		spec.StandbyCluster,
 		customPodEnvVarsList,
 	)
