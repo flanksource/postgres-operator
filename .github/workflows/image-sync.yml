@@ -1,8 +1,8 @@
-name: Publish Docker
+name: Sync Images
 on:
-  - push
-  - schedule:
-    - cron: "* 22 * * *"
+  push:
+  schedule:
+  - cron: "* 22 * * *"
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@master
       - uses: actions/setup-python@v2
       - run: |
-          curl -fSL "https://github.com/genuinetools/reg/releases/download/v0.16.1/reg-linux-amd64" -o "/usr/local/bin/reg"
-          chmod a+x "/usr/local/bin/reg"
-          pip install -r .github/workflows/requirements.txt
+          sudo curl -fSL "https://github.com/genuinetools/reg/releases/download/v0.16.1/reg-linux-amd64" -o "/usr/local/bin/reg"
+          sudo chmod a+x "/usr/local/bin/reg"
+          pip install -r .github/workflows/requirements.txt --user
           python .github/workflows/repo-sync.py
