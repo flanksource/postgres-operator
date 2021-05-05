@@ -3,9 +3,9 @@ FROM golang:1.15 as builder
 WORKDIR /app
 COPY go.mod .
 COPY go.sum .
-RUN go mod vendor
-COPY . .
-RUN make vendor linux
+RUN go mod download
+ADD . .
+RUN make  linux
 
 FROM registry.opensource.zalan.do/library/alpine-3.12:latest
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
