@@ -1,6 +1,6 @@
 # An image to run e2e tests.
 # The image does not include the tests; all necessary files are bind-mounted when a container starts.
-FROM ubuntu:20.04
+FROM ubuntu:groovy-20210416
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
 
 ENV TERM xterm-256color
